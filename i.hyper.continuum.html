@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>i.hyper.continuum - GRASS GIS manual</title>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h2>DESCRIPTION</h2>
+
+<p><em>i.hyper.continuum</em> applies continuum removal to hyperspectral imagery
+imported as 3D raster maps (<code>raster_3d</code>) by
+<a href="i.hyper.import.html">i.hyper.import</a>.</p>
+
+<p>The module performs continuum removal, a spectral processing technique
+that normalizes reflectance spectra to emphasize absorption features.
+Continuum removal divides the original spectrum by a continuum line (or
+envelope) that connects the spectral peaks, effectively removing the
+overall spectral shape and highlighting absorption bands.</p>
+
+<p><em>i.hyper.continuum</em> is part of the <b>i.hyper</b> module family designed for
+hyperspectral data import, processing, and analysis in GRASS. It is
+essential for mineral identification, vegetation analysis, and any
+application requiring detailed analysis of spectral absorption features.</p>
+
+<p>The module allows users to specify a wavelength range for processing,
+producing a spectral subset of the original hyperspectral image. By
+default, it processes the entire spectral range of the input data. Bands
+outside the specified range can optionally be kept unchanged in the
+output.</p>
+
+<p>Three methods are available for calculating the continuum:</p>
+
+<ul>
+  <li><b>convex_hull</b> — Uses convex hull algorithm to find the upper
+    envelope of the spectrum (default, recommended for most applications)</li>
+  <li><b>linear</b> — Simple linear continuum connecting the first and last
+    points in the wavelength range</li>
+  <li><b>polynomial</b> — Polynomial fitting to the spectral envelope (order
+    2-5)</li>
+</ul>
+
+<p>The convex hull method is most widely used in remote sensing as it
+effectively captures the spectral continuum without making assumptions
+about the shape. It identifies the upper envelope by constructing the
+convex hull of the spectral points and extracting the upper boundary.</p>
+
+<p>Continuum-removed reflectance values typically range from 0 to 1, where
+1 represents points on the continuum (spectral peaks) and values less
+than 1 represent absorption features. Deeper absorptions produce values
+closer to 0.</p>
+
+<h2>NOTES</h2>
+
+<p>The module expects input data to be a 3D raster map created by
+<em>i.hyper.import</em> or any 3D raster with wavelength metadata stored in
+band-level metadata following the <em>i.hyper</em> standard format:
+<b>wavelength</b>, <b>FWHM</b>, <b>valid</b>, and <b>unit</b>.</p>
+
+<p>When wavelength metadata is not found, the module will fail with an
+error message. It is essential to use properly imported hyperspectral
+data with wavelength information.</p>
+
+<p>The wavelength range parameters (<em>min_wavelength</em> and <em>max_wavelength</em>)
+define both the spectral region for continuum calculation and the extent
+of the output 3D raster. If not specified, the module uses the minimum
+and maximum wavelengths available in the input data.</p>
+
+<p>The <b>-n</b> flag restricts processing to only bands marked as valid
+(<code>valid=1</code>) in the metadata. This is useful for excluding bands with
+quality issues, such as those affected by atmospheric absorption (water
+vapor bands around 1400 nm and 1900 nm) or sensor artifacts.</p>
+
+<p>The <b>-k</b> flag preserves original reflectance values for bands outside
+the specified wavelength range. Without this flag, all bands in the
+output maintain the structure of the input, but only bands within the
+range undergo continuum removal. This is useful when you want to analyze
+a specific absorption feature while maintaining the full spectral cube
+structure.</p>
+
+<p>The <b>-i</b> flag provides information mode that displays band information
+and processing parameters without creating the output raster. This helps
+verify which bands will be processed before running the full analysis.</p>
+
+<p>For the polynomial method, the order parameter controls the degree of
+the polynomial fit. Lower orders (2-3) produce smoother continua, while
+higher orders (4-5) can follow more complex spectral shapes but may
+overfit noise. The convex hull method is generally preferred as it
+adapts naturally to the spectral shape without requiring parameter
+tuning.</p>
+
+<p>Continuum removal is particularly effective for:</p>
+
+<ul>
+  <li><b>Mineral identification</b>: Absorption features at specific
+    wavelengths indicate different minerals (e.g., clay minerals at
+    2200 nm, iron oxides at 900 nm)</li>
+  <li><b>Vegetation analysis</b>: Chlorophyll absorption around 680 nm, water
+    content features at 1450 nm and 1950 nm</li>
+  <li><b>Comparison across scenes</b>: Normalizing for illumination and
+    atmospheric effects</li>
+  <li><b>Feature depth analysis</b>: Quantifying absorption strength for
+    compositional mapping</li>
+</ul>
+
+<p>The output 3D raster maintains the same spatial resolution and extent as
+the input, with continuum-removed reflectance values replacing the
+original reflectance in the processed wavelength range.</p>
+
+<h2>EXAMPLES</h2>
+
+<div class="code"><pre>
+# Apply continuum removal to entire spectral range using convex hull
+i.hyper.continuum input=prisma \
+                  output=prisma_cr
+
+# The output contains continuum-removed reflectance across all wavelengths
+</pre></div>
+
+<div class="code"><pre>
+# Focus on clay mineral absorption feature (2100-2400 nm)
+i.hyper.continuum input=enmap \
+                  output=enmap_clay_cr \
+                  min_wavelength=2100 \
+                  max_wavelength=2400
+
+# Extract specific band for visualization
+# Band depth at 2200 nm indicates clay mineral presence
+r3.cross.rast input=enmap_clay_cr output=clay_2200nm@2200
+</pre></div>
+
+<div class="code"><pre>
+# Apply linear continuum removal for faster processing
+i.hyper.continuum input=tanager \
+                  output=tanager_cr_linear \
+                  method=linear \
+                  min_wavelength=400 \
+                  max_wavelength=2500
+</pre></div>
+
+<div class="code"><pre>
+# Polynomial continuum with 3rd order fit
+i.hyper.continuum input=prisma \
+                  output=prisma_cr_poly3 \
+                  method=polynomial \
+                  polynomial_order=3 \
+                  min_wavelength=400 \
+                  max_wavelength=2500
+</pre></div>
+
+<div class="code"><pre>
+# Process only iron oxide absorption region (800-1000 nm)
+# Keep other wavelengths unchanged
+i.hyper.continuum input=enmap \
+                  output=enmap_fe_cr \
+                  min_wavelength=800 \
+                  max_wavelength=1000 \
+                  -k
+
+# The -k flag preserves original values outside 800-1000 nm
+</pre></div>
+
+<div class="code"><pre>
+# Preview processing parameters without creating output
+i.hyper.continuum input=prisma \
+                  output=test \
+                  min_wavelength=2000 \
+                  max_wavelength=2400 \
+                  -i
+
+# Info mode displays which bands will be processed
+</pre></div>
+
+<div class="code"><pre>
+# Use only valid bands for processing
+i.hyper.continuum input=enmap \
+                  output=enmap_cr_valid \
+                  min_wavelength=400 \
+                  max_wavelength=2500 \
+                  -n
+
+# Excludes bands with valid=0 (atmospheric absorption, sensor issues)
+</pre></div>
+
+<div class="code"><pre>
+# Complete workflow: mineral mapping with continuum removal
+# Step 1: Import hyperspectral data
+i.hyper.import input=/data/PRISMA.he5 \
+               product=prisma \
+               output=prisma
+
+# Step 2: Apply continuum removal to Al-OH region (clay minerals)
+i.hyper.continuum input=prisma \
+                  output=prisma_aloh_cr \
+                  min_wavelength=2000 \
+                  max_wavelength=2400
+
+# Step 3: Extract band at 2200 nm (main clay absorption)
+r3.cross.rast input=prisma_aloh_cr output=clay_depth@2200
+
+# Step 4: Calculate absorption depth (1 - continuum_removed_reflectance)
+r.mapcalc "absorption_depth = 1.0 - clay_depth"
+
+# Step 5: Classify clay mineral abundance
+r.recode input=absorption_depth output=clay_class &lt;&lt; EOF
+0.0:0.1:1:low
+0.1:0.2:2:moderate
+0.2:1.0:3:high
+EOF
+
+# Step 6: Visualize results
+r.colors map=absorption_depth color=viridis
+d.rast map=absorption_depth
+</pre></div>
+
+<div class="code"><pre>
+# Vegetation water content analysis
+# Step 1: Apply continuum removal to water absorption region
+i.hyper.continuum input=enmap \
+                  output=enmap_water_cr \
+                  min_wavelength=1400 \
+                  max_wavelength=2000
+
+# Step 2: Extract bands at water absorption centers
+r3.cross.rast input=enmap_water_cr output=water_1450@1450
+r3.cross.rast input=enmap_water_cr output=water_1950@1950
+
+# Step 3: Calculate water absorption index
+r.mapcalc "water_index = (1.0 - water_1450) + (1.0 - water_1950)"
+
+# Higher values indicate stronger water absorption (higher water content)
+</pre></div>
+
+<div class="code"><pre>
+# Compare different continuum methods
+# Convex hull (default)
+i.hyper.continuum input=prisma output=prisma_cr_hull \
+                  min_wavelength=2000 max_wavelength=2400
+
+# Linear
+i.hyper.continuum input=prisma output=prisma_cr_linear \
+                  method=linear \
+                  min_wavelength=2000 max_wavelength=2400
+
+# Polynomial order 2
+i.hyper.continuum input=prisma output=prisma_cr_poly2 \
+                  method=polynomial polynomial_order=2 \
+                  min_wavelength=2000 max_wavelength=2400
+
+# Extract same band from each for comparison
+r3.cross.rast input=prisma_cr_hull output=hull_2200@2200
+r3.cross.rast input=prisma_cr_linear output=linear_2200@2200
+r3.cross.rast input=prisma_cr_poly2 output=poly2_2200@2200
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<a href="i.hyper.import.html">i.hyper.import</a>,
+<a href="i.hyper.rgb.html">i.hyper.rgb</a>,
+<a href="i.hyper.albedo.html">i.hyper.albedo</a>,
+<a href="i.hyper.composite.html">i.hyper.composite</a>,
+<a href="i.hyper.preproc.html">i.hyper.preproc</a>,
+<a href="i.hyper.explore.html">i.hyper.explore</a>,
+<a href="i.hyper.export.html">i.hyper.export</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r3.cross.rast.html">r3.cross.rast</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r.mapcalc.html">r.mapcalc</a>,
+<a href="https://grass.osgeo.org/grass-stable/manuals/r3.support.html">r3.support</a>
+
+<h2>REFERENCES</h2>
+
+<ul>
+  <li>Clark, R. N., &amp; Roush, T. L. (1984). Reflectance spectroscopy:
+    Quantitative analysis techniques for remote sensing applications.
+    <em>Journal of Geophysical Research: Solid Earth</em>, 89(B7), 6329-6340.</li>
+  <li>Kokaly, R. F., &amp; Clark, R. N. (1999). Spectroscopic determination of
+    leaf biochemistry using band-depth analysis of absorption features and
+    stepwise multiple linear regression. <em>Remote Sensing of Environment</em>,
+    67(3), 267-287.</li>
+  <li>van der Meer, F. (2004). Analysis of spectral absorption features in
+    hyperspectral imagery. <em>International Journal of Applied Earth
+    Observation and Geoinformation</em>, 5(1), 55-68.</li>
+  <li>Kruse, F. A., et al. (1993). The spectral image processing system
+    (SIPS)—interactive visualization and analysis of imaging spectrometer
+    data. <em>Remote Sensing of Environment</em>, 44(2-3), 145-163.</li>
+</ul>
+
+<h2>AUTHORS</h2>
+
+<p>Created for the i.hyper module family</p>
+
+<p>Based on work by Alen Mangafić and Tomaž Žagar, Geodetic Institute of Slovenia</p>
+
+</body>
+</html>
