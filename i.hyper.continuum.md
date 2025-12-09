@@ -81,14 +81,14 @@ tuning.
 
 Continuum removal is particularly effective for:
 
-- **Mineral identification**: Absorption features at specific
+- **Mineral identification** : Absorption features at specific
   wavelengths indicate different minerals (e.g., clay minerals at
   2200 nm, iron oxides at 900 nm)
-- **Vegetation analysis**: Chlorophyll absorption around 680 nm, water
+- **Vegetation analysis** : Chlorophyll absorption around 680 nm, water
   content features at 1450 nm and 1950 nm
-- **Comparison across scenes**: Normalizing for illumination and
+- **Comparison across scenes** : Normalizing for illumination and
   atmospheric effects
-- **Feature depth analysis**: Quantifying absorption strength for
+- **Feature depth analysis** : Quantifying absorption strength for
   compositional mapping
 
 The output 3D raster maintains the same spatial resolution and extent as
