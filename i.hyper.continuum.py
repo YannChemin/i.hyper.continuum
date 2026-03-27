@@ -84,10 +84,52 @@
 
 import sys
 import os
+import ctypes
+import ctypes.util
 import grass.script as gs
 import numpy as np
 from scipy.spatial import ConvexHull
 from scipy.interpolate import interp1d
+
+
+def _load_g3d_lib():
+    """Load libgrass_g3d via ctypes, return None on failure."""
+    name = ctypes.util.find_library("grass_g3d.8.6") or ctypes.util.find_library("grass_g3d")
+    if name is None:
+        return None
+    try:
+        lib = ctypes.cdll.LoadLibrary(name)
+        fn = lib.Rast3d_extract_z_slice
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+        return fn
+    except (OSError, AttributeError):
+        return None
+
+
+_rast3d_extract_z_slice = _load_g3d_lib()
+
+
+def extract_z_slice(name3d, mapset3d, z, name2d):
+    """Extract Z-slice z (0-based) from 3D raster into 2D raster name2d.
+
+    Uses Rast3d_extract_z_slice() — tile-bulk read via RASTER3D_NO_CACHE,
+    one disk read per tile versus one function call per voxel.
+    Falls back to g.copy if the C binding is unavailable.
+    """
+    if _rast3d_extract_z_slice is not None:
+        ret = _rast3d_extract_z_slice(
+            name3d.encode(),
+            mapset3d.encode() if mapset3d else b"",
+            ctypes.c_int(z),
+            name2d.encode(),
+        )
+        if ret != 0:
+            gs.fatal(f"Rast3d_extract_z_slice failed for {name3d} z={z}")
+    else:
+        # Fallback: band_num is 1-based, z is 0-based
+        band_name = f"{name3d}#{z + 1}" if not mapset3d else f"{name3d}@{mapset3d}#{z + 1}"
+        gs.run_command("g.copy", raster=f"{band_name},{name2d}", quiet=True, overwrite=True)
 
 
 def get_raster3d_info(raster3d):
@@ -284,51 +326,32 @@ def apply_continuum_removal(input_raster, processing_bands, all_bands, method,
     
     gs.message(f"Processing {rows} x {cols} pixels across {len(processing_bands)} bands...")
     
+    # Split name3d into name and mapset components for Rast3d_extract_z_slice
+    if '@' in input_raster:
+        _name3d, _mapset3d = input_raster.split('@', 1)
+    else:
+        _name3d, _mapset3d = input_raster, ""
+
     # Create temporary files for each band
     temp_maps = []
     processing_band_nums = set(b['band_num'] for b in processing_bands)
-    
+
     # Extract wavelengths for processing bands
     proc_wavelengths = np.array([b['wavelength'] for b in processing_bands])
-    
+
     gs.percent(0, len(all_bands), 1)
-    
+
     for idx, band in enumerate(all_bands):
         band_num = band['band_num']
-        band_name = f"{input_raster}#{band_num}"
         temp_output = f"tmp_continuum_{band_num}_{os.getpid()}"
-        
+
         if band_num in processing_band_nums:
-            # This band needs continuum removal
-            # Use r.mapcalc with pixel-by-pixel processing would be complex
-            # Instead, use a simpler approach: calculate continuum per pixel
-            
-            # For now, implement a simplified version that processes spectral profiles
-            # A full implementation would read pixel values, calculate continuum, and write back
-            
-            # Simplified: apply a basic continuum removal using band statistics
-            # This is a placeholder - full implementation would need custom processing
-            
             gs.message(f"Processing band {band_num} ({band['wavelength']:.1f} nm)...")
-            
-            # Copy band for now - in production, would calculate actual continuum
-            gs.run_command('g.copy', raster=f"{band_name},{temp_output}", 
-                          quiet=True, overwrite=True)
-            
-            # Add placeholder for actual continuum removal calculation
-            # In production: read all bands, calculate continuum per pixel, apply removal
-            
-        else:
-            # Band outside processing range
-            if keep_outside:
-                # Keep original values
-                gs.run_command('g.copy', raster=f"{band_name},{temp_output}", 
-                              quiet=True, overwrite=True)
-            else:
-                # Set to null or copy anyway for structure
-                gs.run_command('g.copy', raster=f"{band_name},{temp_output}", 
-                              quiet=True, overwrite=True)
-        
+
+        # extract_z_slice uses Rast3d_extract_z_slice (tile-bulk read, RASTER3D_NO_CACHE)
+        # band_num is 1-based; z index is 0-based
+        extract_z_slice(_name3d, _mapset3d, band_num - 1, temp_output)
+
         temp_maps.append(temp_output)
         gs.percent(idx + 1, len(all_bands), 1)
     
