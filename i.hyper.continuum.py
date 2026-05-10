@@ -1,4 +1,17 @@
 #!/usr/bin/env python
+# ── ras3d standalone detection ────────────────────────────────────────────────
+import os as _os
+_RAS3D = False
+if not _os.environ.get('GISBASE'):
+    try:
+        import importlib.util as _ilu
+        if _ilu.find_spec('ras3d') and _ilu.find_spec('ras3d_grass_shim'):
+            from ras3d_grass_shim import install as _r3_install
+            _r3_install()
+            _RAS3D = True
+    except Exception:
+        pass
+# ─────────────────────────────────────────────────────────────────────────────
 ##############################################################################
 # MODULE:    i.hyper.continuum
 # AUTHOR(S): Created for hyperspectral continuum removal
@@ -117,6 +130,15 @@ def extract_z_slice(name3d, mapset3d, z, name2d):
     one disk read per tile versus one function call per voxel.
     Falls back to g.copy if the C binding is unavailable.
     """
+    if _RAS3D:
+        import ras3d as _r3, ras3d_write as _r3w
+        _h = _r3.open_cube(name3d)
+        _arr = _r3.get_band(_h, z)
+        from ras3d_grass_shim import get_band_cache
+        get_band_cache()[name2d] = _arr
+        _r3w.write_raster2d(_r3w.outpath(name2d), _arr, _h)
+        _r3.close_cube(_h)
+        return
     if _rast3d_extract_z_slice is not None:
         ret = _rast3d_extract_z_slice(
             name3d.encode(),
@@ -357,15 +379,25 @@ def apply_continuum_removal(input_raster, processing_bands, all_bands, method,
     
     # Create 3D raster from temporary 2D rasters
     gs.message("Creating output 3D raster...")
-    
-    try:
-        # Use r3.cross.rast or similar to create 3D raster
-        # For now, this is a simplified placeholder
-        gs.run_command('r3.cross.rast', input=','.join(temp_maps), 
-                      output=output_raster, overwrite=True)
-    except:
-        gs.warning("r3.cross.rast not available, using alternative method")
-        # Alternative: manually create 3D structure
+
+    _band_wavelengths_nm = [b['wavelength'] for b in all_bands]
+
+    if _RAS3D:
+        import numpy as _np, ras3d as _r3, ras3d_write as _r3w
+        from ras3d_grass_shim import get_band_cache
+        _cube = _np.stack([get_band_cache()[m] for m in temp_maps], axis=0)
+        _h = _r3.open_cube(input_raster)
+        _r3w.write_raster3d(_r3w.outpath(output_raster), _cube, _h, wavelengths=_band_wavelengths_nm)
+        _r3.close_cube(_h)
+    else:
+        try:
+            # Use r3.cross.rast or similar to create 3D raster
+            # For now, this is a simplified placeholder
+            gs.run_command('r3.cross.rast', input=','.join(temp_maps),
+                          output=output_raster, overwrite=True)
+        except:
+            gs.warning("r3.cross.rast not available, using alternative method")
+            # Alternative: manually create 3D structure
     
     # Clean up temporary maps
     gs.message("Cleaning up temporary files...")
