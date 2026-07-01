@@ -205,8 +205,55 @@ def convert_wavelength_to_nm(wavelength, unit):
         return wavelength
 
 
+def _load_hyper_json_bands(raster3d):
+    """Read wavelength/fwhm/validity from i.hyper.import's JSON sidecar.
+
+    i.hyper.import (HyperMetadata) stores band metadata at
+    $MAPSET/grid3/<mapname>/hyper.json rather than in r3.support history,
+    so that must be checked before falling back to r.support probing.
+    """
+    import json as _json
+
+    name, mapset = (raster3d.split('@', 1) if '@' in raster3d
+                     else (raster3d, None))
+    try:
+        env = gs.gisenv()
+        mapset = mapset or env['MAPSET']
+        path = os.path.join(env['GISDBASE'], env['LOCATION_NAME'], mapset,
+                            'grid3', name, 'hyper.json')
+    except Exception:
+        return []
+
+    if not os.path.isfile(path):
+        return []
+
+    with open(path) as _fj:
+        data = _json.load(_fj)
+
+    b = data.get('bands') or {}
+    wavelengths = b.get('wavelength')
+    if not wavelengths:
+        return []
+    fwhms = b.get('fwhm') or []
+    valids = b.get('validity') or []
+
+    return [{'band_num': i + 1, 'wavelength': float(wl),
+             'fwhm': float(fwhms[i]) if i < len(fwhms) else 0,
+             'valid': bool(valids[i]) if i < len(valids) else True,
+             'unit': 'nm'}
+            for i, wl in enumerate(wavelengths)]
+
+
 def get_all_band_wavelengths(raster3d, only_valid=False):
     """Extract all band wavelengths and metadata from 3D raster"""
+    json_bands = _load_hyper_json_bands(raster3d)
+    if json_bands:
+        if only_valid:
+            json_bands = [b for b in json_bands if b['valid']]
+        json_bands.sort(key=lambda x: x['wavelength'])
+        if json_bands:
+            return json_bands
+
     info = get_raster3d_info(raster3d)
     depths = int(info['depths'])
     
