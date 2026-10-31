@@ -244,6 +244,47 @@ def _load_hyper_json_bands(raster3d):
             for i, wl in enumerate(wavelengths)]
 
 
+def _read_wl_sidecar(raster3d):
+    """Read the ras3d ``<cube>.wl.json`` sidecar, or return [].
+
+    The canonical writer is ``ras3d_write`` (and *i.hyper.atcorr* in
+    direct-file mode): the path is the cube path with its extension
+    stripped plus ``.wl.json``, and the payload is a flat JSON list of
+    band-centre wavelengths. A list of dicts carrying ``wavelength`` is
+    accepted too, so a richer sidecar written later still loads.
+
+    :param str raster3d: cube path or 3D raster name
+    :return: list of ``(wavelength_nm, fwhm_or_None, valid)`` tuples
+    :rtype: list[tuple]
+    """
+    import json as _json
+
+    for _sfx in ('.tif', '.tiff', '.h5', '.hdf5', '.vrt', '.img', ''):
+        _base = (raster3d.removesuffix(_sfx) if _sfx and raster3d.endswith(_sfx)
+                 else raster3d)
+        _wlp = _base + '.wl.json'
+        if not os.path.isfile(_wlp):
+            continue
+        with open(_wlp) as _fj:
+            _data = _json.load(_fj)
+        _out = []
+        for _entry in _data:
+            if isinstance(_entry, dict):
+                _wl = float(_entry['wavelength'])
+                _fwhm = (float(_entry['fwhm'])
+                         if _entry.get('fwhm') is not None else None)
+                _valid = bool(_entry.get('valid', True))
+            else:
+                _wl, _fwhm, _valid = float(_entry), None, True
+            # ras3d_write stores nm, but i.hyper.atcorr has written um.
+            if _wl < 10.0:
+                _wl *= 1000.0
+            _out.append((_wl, _fwhm, _valid))
+        if _out:
+            return _out
+    return []
+
+
 def get_all_band_wavelengths(raster3d, only_valid=False):
     """Extract all band wavelengths and metadata from 3D raster"""
     json_bands = _load_hyper_json_bands(raster3d)
@@ -253,6 +294,19 @@ def get_all_band_wavelengths(raster3d, only_valid=False):
         json_bands.sort(key=lambda x: x['wavelength'])
         if json_bands:
             return json_bands
+
+    # A cube opened straight from a file has no GRASS metadata, so fall back
+    # to the ras3d .wl.json sidecar before probing r3.info history.
+    sidecar = [{'band_num': i, 'wavelength': wl,
+                'fwhm': fwhm if fwhm is not None else 0,
+                'valid': valid, 'unit': 'nm'}
+               for i, (wl, fwhm, valid) in
+               enumerate(_read_wl_sidecar(raster3d), start=1)]
+    if only_valid:
+        sidecar = [b for b in sidecar if b['valid']]
+    if sidecar:
+        sidecar.sort(key=lambda x: x['wavelength'])
+        return sidecar
 
     info = get_raster3d_info(raster3d)
     depths = int(info['depths'])
