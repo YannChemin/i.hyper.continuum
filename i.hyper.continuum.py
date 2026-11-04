@@ -69,6 +69,23 @@ if not _os.environ.get('GISBASE'):
 # %end
 
 # %option
+# % key: normalization
+# % type: string
+# % required: no
+# % options: division,subtraction
+# % answer: division
+# % description: Normalise the spectrum against the continuum by division (hull quotient, bounded 0-1) or subtraction (residual, keeps absolute depth)
+# %end
+
+# %option
+# % key: max_gap
+# % type: double
+# % required: no
+# % answer: 0
+# % description: Width in nm above which a step between band centres is a sensor gap, so the continuum is computed on each side separately. 0 detects gaps as 3x the median band spacing; a negative value disables the split
+# %end
+
+# %option
 # % key: polynomial_order
 # % type: integer
 # % required: no
@@ -99,24 +116,44 @@ import sys
 import os
 import ctypes
 import ctypes.util
+import re
 import grass.script as gs
 import numpy as np
-from scipy.spatial import ConvexHull
-from scipy.interpolate import interp1d
 
 
 def _load_g3d_lib():
-    """Load libgrass_g3d via ctypes, return None on failure."""
-    name = ctypes.util.find_library("grass_g3d.8.6") or ctypes.util.find_library("grass_g3d")
-    if name is None:
+    """Load libgrass_g3d via ctypes, return None on failure.
+
+    The GIS library has to be initialised before any GRASS library call, or
+    every one of them reports "System not initialized" and fails. G_gisinit
+    is a macro, so the symbol to call is G__no_gisinit, and it takes the
+    headers version it was built against, which is read from version.h in
+    the running GISBASE rather than hard-coded. This mirrors what
+    i.hyper.sleuth does for the same library.
+    """
+    gisbase = os.environ.get("GISBASE")
+    if not gisbase:
         return None
+    lib_dir = os.path.join(gisbase, "lib")
     try:
-        lib = ctypes.cdll.LoadLibrary(name)
+        version_header = os.path.join(gisbase, "include", "grass", "version.h")
+        with open(version_header) as handle:
+            match = re.search(r'#define\s+GRASS_HEADERS_VERSION\s+"([^"]+)"',
+                              handle.read())
+        headers_version = match.group(1).encode() if match else b""
+
+        gis_lib = ctypes.CDLL(os.path.join(lib_dir, "libgrass_gis.so"),
+                              mode=ctypes.RTLD_GLOBAL)
+        gis_lib.G__no_gisinit.restype = None
+        gis_lib.G__no_gisinit.argtypes = [ctypes.c_char_p]
+        gis_lib.G__no_gisinit(headers_version)
+
+        lib = ctypes.CDLL(os.path.join(lib_dir, "libgrass_g3d.so"))
         fn = lib.Rast3d_extract_z_slice
         fn.restype = ctypes.c_int
         fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
         return fn
-    except (OSError, AttributeError):
+    except (OSError, AttributeError, KeyError):
         return None
 
 
@@ -364,49 +401,50 @@ def filter_bands_by_wavelength(bands, min_wl, max_wl):
 
 
 def calculate_convex_hull_continuum(wavelengths, reflectances):
-    """Calculate continuum using convex hull method"""
-    # Create points array
-    points = np.column_stack([wavelengths, reflectances])
-    
-    try:
-        # Calculate convex hull
-        hull = ConvexHull(points)
-        
-        # Get upper envelope vertices
-        # Find vertices on the upper part of the hull
-        hull_vertices = hull.vertices
-        hull_points = points[hull_vertices]
-        
-        # Sort by wavelength
-        sorted_indices = np.argsort(hull_points[:, 0])
-        sorted_hull = hull_points[sorted_indices]
-        
-        # Find the upper envelope by taking points that form the upper boundary
-        # Start from leftmost point, only keep points that go up or maintain height
-        upper_envelope = [sorted_hull[0]]
-        
-        for i in range(1, len(sorted_hull)):
-            # Keep point if reflectance is >= previous point's reflectance
-            if sorted_hull[i, 1] >= upper_envelope[-1][1]:
-                upper_envelope.append(sorted_hull[i])
-        
-        upper_envelope = np.array(upper_envelope)
-        
-        # Interpolate continuum for all wavelengths
-        if len(upper_envelope) < 2:
-            # Fallback to linear continuum
-            continuum = np.linspace(reflectances[0], reflectances[-1], len(wavelengths))
-        else:
-            interp_func = interp1d(upper_envelope[:, 0], upper_envelope[:, 1], 
-                                  kind='linear', fill_value='extrapolate')
-            continuum = interp_func(wavelengths)
-        
-        return continuum
-        
-    except Exception as e:
-        gs.warning(f"Convex hull calculation failed: {e}, using linear continuum")
-        # Fallback to linear
-        return np.linspace(reflectances[0], reflectances[-1], len(wavelengths))
+    """Calculate continuum as the upper convex hull of the spectrum.
+
+    Monotone chain in wavelength order: a vertex is dropped as soon as a
+    later point shows it is not on the upper boundary. The first and last
+    band are always kept, so the continuum spans the whole spectrum and no
+    value is extrapolated.
+
+    The hull has to be able to descend. An envelope assembled from
+    monotonically rising points stops at the reflectance maximum, and every
+    band beyond it is then divided by a continuum extrapolated far above the
+    spectrum. On a VNIR-SWIR cube that is the entire SWIR, where the
+    diagnostic mineral and polymer features are, and it turns the falling
+    limb into one huge spurious absorption: measured on a drone cube, a
+    vegetation spectrum peaking at 900 nm gave a continuum of 5197 against a
+    spectrum of 390 at 2400 nm, and a band depth of 0.702 at 1716 nm where
+    the true upper hull gives 0.447.
+    """
+    wl = np.asarray(wavelengths, dtype=float)
+    refl = np.asarray(reflectances, dtype=float)
+
+    finite = np.isfinite(wl) & np.isfinite(refl)
+    if finite.sum() < 2:
+        return calculate_linear_continuum(wavelengths, reflectances)
+
+    order = np.argsort(wl[finite])
+    xs = wl[finite][order]
+    ys = refl[finite][order]
+
+    hull = []
+    for x, y in zip(xs, ys):
+        # Drop the last vertex while it sits on or below the line joining
+        # the one before it to the new point, which means it is not on the
+        # upper hull.
+        while len(hull) >= 2:
+            (x1, y1), (x2, y2) = hull[-2], hull[-1]
+            if (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1) < 0:
+                break
+            hull.pop()
+        hull.append((float(x), float(y)))
+
+    if len(hull) < 2:
+        return calculate_linear_continuum(wavelengths, reflectances)
+
+    return np.interp(wl, [p[0] for p in hull], [p[1] for p in hull])
 
 
 def calculate_linear_continuum(wavelengths, reflectances):
@@ -436,8 +474,171 @@ def calculate_polynomial_continuum(wavelengths, reflectances, order=2):
         return calculate_linear_continuum(wavelengths, reflectances)
 
 
-def apply_continuum_removal(input_raster, processing_bands, all_bands, method, 
-                           polynomial_order, output_raster, keep_outside):
+def spectral_segments(wavelengths, max_gap=0.0):
+    """Index ranges of contiguous spectral coverage.
+
+    A continuum drawn across a region the sensor does not sample is an
+    interpolation between two unrelated shoulders, and dividing by it
+    manufactures an absorption that was never measured. Measured on the C2RD
+    drone cube, whose 1784.5-1984.0 nm gap swallows the 1940 nm water band, a
+    hull spanning the gap returned depths of 0.64 to 0.70 on water targets
+    where nothing had been observed at all.
+
+    :param wavelengths: band centres in nm, ascending.
+    :param max_gap: a step wider than this starts a new segment. 0 uses three
+        times the median step, which separates real gaps from the uneven
+        spacing of a VNIR-SWIR join. Negative disables the split.
+    :return: list of (start, stop) index pairs, stop exclusive.
+    """
+    wl = np.asarray(wavelengths, dtype=float)
+    if wl.size < 2 or max_gap < 0:
+        return [(0, wl.size)]
+    steps = np.diff(wl)
+    cut = max_gap if max_gap > 0 else 3.0 * float(np.median(steps))
+    breaks = [0, *(np.where(steps > cut)[0] + 1).tolist(), wl.size]
+    return [(breaks[i], breaks[i + 1]) for i in range(len(breaks) - 1)]
+
+
+def calculate_continuum(wavelengths, reflectances, method, polynomial_order):
+    """Dispatch to the chosen continuum, on one contiguous segment."""
+    if method == 'convex_hull':
+        return calculate_convex_hull_continuum(wavelengths, reflectances)
+    if method == 'polynomial':
+        return calculate_polynomial_continuum(wavelengths, reflectances,
+                                              polynomial_order)
+    return calculate_linear_continuum(wavelengths, reflectances)
+
+
+def remove_continuum_spectrum(wavelengths, reflectances, method,
+                              polynomial_order, normalization, segments):
+    """Continuum-remove one spectrum, each coverage segment on its own.
+
+    :param normalization: ``division`` gives the hull quotient, bounded by 1
+        for a continuum at or above the spectrum; ``subtraction`` gives the
+        residual, which keeps the absolute size of the absorption. Both are
+        in Clark and Roush (1984); division is what ENVI reports.
+    :return: the continuum-removed spectrum, null where it is undefined.
+    """
+    wl = np.asarray(wavelengths, dtype=float)
+    refl = np.asarray(reflectances, dtype=float)
+    out = np.full(refl.shape, np.nan, dtype=float)
+
+    for start, stop in segments:
+        if stop - start < 2:
+            continue
+        seg_wl = wl[start:stop]
+        seg_refl = refl[start:stop]
+        if not np.isfinite(seg_refl).any():
+            continue
+        continuum = calculate_continuum(seg_wl, seg_refl, method,
+                                        polynomial_order)
+        continuum = np.asarray(continuum, dtype=float)
+        if normalization == 'subtraction':
+            out[start:stop] = seg_refl - continuum
+        else:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                out[start:stop] = np.where(continuum > 0,
+                                           seg_refl / continuum, np.nan)
+    return out
+
+
+def _remove_continuum_over_region(temp_maps, all_bands, processing_band_nums,
+                                  method, polynomial_order, normalization,
+                                  max_gap, keep_outside, rows, cols):
+    """Replace each band slice with its continuum-removed values.
+
+    Works in row blocks: a block holds every band for a few rows, which is
+    the shape the continuum needs (one spectrum per pixel) while keeping the
+    memory bounded. Each output band is streamed to its own binary file and
+    read back with r.in.bin, so the full output cube is never held at once.
+
+    :return: the list of output 2D map names, in band order.
+    """
+    from grass.script import array as garray
+
+    wavelengths = np.array([b['wavelength'] for b in all_bands], dtype=float)
+    processed = np.array([b['band_num'] in processing_band_nums
+                          for b in all_bands], dtype=bool)
+    n_bands = len(all_bands)
+    if not processed.any():
+        gs.fatal("No bands fall inside the requested wavelength range")
+
+    segments = spectral_segments(wavelengths[processed], max_gap)
+    gs.verbose(f"{len(segments)} contiguous coverage segment(s) over "
+               f"{int(processed.sum())} bands")
+
+    # About 400 MB of float64 per block, and at least one row.
+    block_rows = max(1, min(rows, int(400e6 / max(1, n_bands * cols * 8))))
+
+    tmpdir = gs.tempdir()
+    handles = [open(os.path.join(tmpdir, f"b{i}.bin"), "wb")
+               for i in range(n_bands)]
+    region = gs.region()
+
+    gs.percent(0, rows, 1)
+    done = 0
+    try:
+        for start in range(0, rows, block_rows):
+            stop = min(start + block_rows, rows)
+            gs.use_temp_region()
+            gs.run_command(
+                'g.region',
+                n=region['n'] - start * region['nsres'],
+                s=region['n'] - stop * region['nsres'],
+                w=region['w'], e=region['e'],
+                nsres=region['nsres'], ewres=region['ewres'], quiet=True)
+            try:
+                cube = np.stack([np.asarray(garray.array(mapname=m),
+                                            dtype=float)
+                                 for m in temp_maps], axis=0)
+            finally:
+                gs.del_temp_region()
+
+            nrow, ncol = cube.shape[1], cube.shape[2]
+            flat = cube.reshape(n_bands, nrow * ncol)
+            out = np.full_like(flat, np.nan)
+            if keep_outside:
+                out[~processed] = flat[~processed]
+            sub_wl = wavelengths[processed]
+            for pixel in range(flat.shape[1]):
+                spectrum = flat[processed, pixel]
+                if not np.isfinite(spectrum).any():
+                    continue
+                out[processed, pixel] = remove_continuum_spectrum(
+                    sub_wl, spectrum, method, polynomial_order,
+                    normalization, segments)
+
+            out = out.reshape(n_bands, nrow, ncol)
+            for i in range(n_bands):
+                handles[i].write(np.ascontiguousarray(out[i],
+                                                      dtype=np.float64).tobytes())
+            done = stop
+            gs.percent(done, rows, 1)
+    finally:
+        for handle in handles:
+            handle.close()
+
+    # A NaN in a DCELL raster is GRASS's own null, so the bands with no
+    # measurement come back as null rather than as a plausible number.
+    out_maps = []
+    for i, band in enumerate(all_bands):
+        name = f"tmp_cr_{band['band_num']}_{os.getpid()}"
+        gs.run_command('r.in.bin', flags='f', input=os.path.join(tmpdir,
+                       f"b{i}.bin"), output=name, bytes=8,
+                       north=region['n'], south=region['s'],
+                       east=region['e'], west=region['w'],
+                       rows=rows, cols=cols, anull='nan',
+                       overwrite=True, quiet=True)
+        out_maps.append(name)
+
+    gs.run_command('g.remove', type='raster', name=','.join(temp_maps),
+                   flags='f', quiet=True)
+    return out_maps
+
+
+def apply_continuum_removal(input_raster, processing_bands, all_bands, method,
+                            polynomial_order, output_raster, keep_outside,
+                            normalization='division', max_gap=0.0):
     """Apply continuum removal to hyperspectral data"""
     
     gs.message(f"Applying continuum removal using {method} method...")
@@ -477,7 +678,17 @@ def apply_continuum_removal(input_raster, processing_bands, all_bands, method,
 
         temp_maps.append(temp_output)
         gs.percent(idx + 1, len(all_bands), 1)
-    
+
+    # --- the continuum removal itself ------------------------------------
+    # The band slices above are the input; this replaces each of them with
+    # its continuum-removed values, in row blocks so that a large region
+    # never needs the whole cube in memory. Bands outside the processing
+    # range are left as they are when keep_outside is set, and nulled
+    # otherwise, so the output never implies a measurement that was not made.
+    temp_maps = _remove_continuum_over_region(
+        temp_maps, all_bands, processing_band_nums, method, polynomial_order,
+        normalization, max_gap, keep_outside, rows, cols)
+
     # Create 3D raster from temporary 2D rasters
     gs.message("Creating output 3D raster...")
 
@@ -491,14 +702,15 @@ def apply_continuum_removal(input_raster, processing_bands, all_bands, method,
         _r3w.write_raster3d(_r3w.outpath(output_raster), _cube, _h, wavelengths=_band_wavelengths_nm)
         _r3.close_cube(_h)
     else:
-        try:
-            # Use r3.cross.rast or similar to create 3D raster
-            # For now, this is a simplified placeholder
-            gs.run_command('r3.cross.rast', input=','.join(temp_maps),
-                          output=output_raster, overwrite=True)
-        except:
-            gs.warning("r3.cross.rast not available, using alternative method")
-            # Alternative: manually create 3D structure
+        # r.to.rast3 stacks the per-band 2D slices back into one 3D raster,
+        # taking the depth order from the order of the list. r3.cross.rast is
+        # the opposite operation, cutting a 2D section out of a 3D raster, so
+        # it never wrote this output and the failure was swallowed by a bare
+        # except that then reported success.
+        gs.run_command('r.to.rast3', input=','.join(temp_maps),
+                       output=output_raster, overwrite=True)
+        if not gs.find_file(output_raster, element='grid3')['name']:
+            gs.fatal(f"Failed to write 3D raster map <{output_raster}>")
     
     # Clean up temporary maps
     gs.message("Cleaning up temporary files...")
@@ -520,7 +732,6 @@ def print_band_info(all_bands, processing_bands, method):
     gs.message(f"Method: {method}")
     gs.message(f"Total bands in input: {len(all_bands)}")
     gs.message(f"Bands to process: {len(processing_bands)}")
-    gs.message("")
     gs.message(f"{'Band':>6} | {'Wavelength (nm)':>16} | {'FWHM':>8} | {'Process':>10}")
     gs.message("-" * 70)
     
@@ -547,6 +758,8 @@ def main(options, flags):
     max_wl = options.get('max_wavelength', None)
     method = options['method']
     polynomial_order = int(options['polynomial_order'])
+    normalization = options['normalization']
+    max_gap = float(options['max_gap'])
     only_valid = flags['n']
     keep_outside = flags['k']
     info_only = flags['i']
@@ -563,14 +776,17 @@ def main(options, flags):
     if not all_bands:
         gs.fatal("No valid bands found in input")
     
-    # Determine wavelength range
-    if min_wl is None:
+    # Determine wavelength range. The parser hands back an empty string for
+    # an option the user left out, never None, so both of these have to test
+    # for emptiness: float("") raises and the documented default of "use the
+    # minimum available wavelength" was unreachable.
+    if not min_wl:
         min_wl = all_bands[0]['wavelength']
         gs.message(f"Using minimum available wavelength: {min_wl:.1f} nm")
     else:
         min_wl = float(min_wl)
     
-    if max_wl is None:
+    if not max_wl:
         max_wl = all_bands[-1]['wavelength']
         gs.message(f"Using maximum available wavelength: {max_wl:.1f} nm")
     else:
@@ -593,8 +809,9 @@ def main(options, flags):
     
     # Apply continuum removal
     apply_continuum_removal(
-        input_raster, processing_bands, all_bands_out, 
-        method, polynomial_order, output_raster, keep_outside
+        input_raster, processing_bands, all_bands_out,
+        method, polynomial_order, output_raster, keep_outside,
+        normalization, max_gap
     )
     
     # Copy metadata to output
